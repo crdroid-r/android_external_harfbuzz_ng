@@ -33,24 +33,16 @@
 /* Bi-directional map */
 struct hb_bimap_t
 {
-  /* XXX(remove) */
-  void init ()
-  {
-    forw_map.init ();
-    back_map.init ();
-  }
-
-  /* XXX(remove) */
-  void fini ()
-  {
-    forw_map.fini ();
-    back_map.fini ();
-  }
-
   void reset ()
   {
     forw_map.reset ();
     back_map.reset ();
+  }
+
+  void resize (unsigned pop)
+  {
+    forw_map.resize (pop);
+    back_map.resize (pop);
   }
 
   bool in_error () const { return forw_map.in_error () || back_map.in_error (); }

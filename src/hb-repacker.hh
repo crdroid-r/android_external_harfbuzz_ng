@@ -37,31 +37,28 @@
  * For a detailed writeup on the overflow resolution algorithm see:
  * docs/repacker.md
  */
-
 struct graph_t
 {
   struct vertex_t
   {
-    vertex_t () :
-        distance (0),
-        space (0),
-        parents (),
-        start (0),
-        end (0),
-        priority(0) {}
-
-    void fini () {
-      obj.fini ();
-      parents.fini ();
-    }
-
     hb_serialize_context_t::object_t obj;
-    int64_t distance;
-    int64_t space;
+    int64_t distance = 0 ;
+    int64_t space = 0 ;
     hb_vector_t<unsigned> parents;
-    unsigned start;
-    unsigned end;
-    unsigned priority;
+    unsigned start = 0;
+    unsigned end = 0;
+    unsigned priority = 0;
+
+    friend void swap (vertex_t& a, vertex_t& b)
+    {
+      hb_swap (a.obj, b.obj);
+      hb_swap (a.distance, b.distance);
+      hb_swap (a.space, b.space);
+      hb_swap (a.parents, b.parents);
+      hb_swap (a.start, b.start);
+      hb_swap (a.end, b.end);
+      hb_swap (a.priority, b.priority);
+    }
 
     bool is_shared () const
     {
@@ -153,7 +150,8 @@ struct graph_t
    * the 'packed' object stack used internally in the
    * serializer
    */
-  graph_t (const hb_vector_t<hb_serialize_context_t::object_t *>& objects)
+  template<typename T>
+  graph_t (const T& objects)
       : parents_invalid (true),
         distance_invalid (true),
         positions_invalid (true),
@@ -161,6 +159,8 @@ struct graph_t
   {
     num_roots_for_space_.push (1);
     bool removed_nil = false;
+    vertices_.alloc (objects.length);
+    vertices_scratch_.alloc (objects.length);
     for (unsigned i = 0; i < objects.length; i++)
     {
       // TODO(grieger): check all links point to valid objects.
@@ -186,7 +186,7 @@ struct graph_t
 
   ~graph_t ()
   {
-    vertices_.fini_deep ();
+    vertices_.fini ();
   }
 
   bool in_error () const
@@ -260,59 +260,6 @@ struct graph_t
   }
 
   /*
-   * Generates a new topological sorting of graph using Kahn's
-   * algorithm: https://en.wikipedia.org/wiki/Topological_sorting#Algorithms
-   */
-  void sort_kahn ()
-  {
-    positions_invalid = true;
-
-    if (vertices_.length <= 1) {
-      // Graph of 1 or less doesn't need sorting.
-      return;
-    }
-
-    hb_vector_t<unsigned> queue;
-    hb_vector_t<vertex_t> sorted_graph;
-    if (unlikely (!check_success (sorted_graph.resize (vertices_.length)))) return;
-    hb_vector_t<unsigned> id_map;
-    if (unlikely (!check_success (id_map.resize (vertices_.length)))) return;
-
-    hb_vector_t<unsigned> removed_edges;
-    if (unlikely (!check_success (removed_edges.resize (vertices_.length)))) return;
-    update_parents ();
-
-    queue.push (root_idx ());
-    int new_id = vertices_.length - 1;
-
-    while (!queue.in_error () && queue.length)
-    {
-      unsigned next_id = queue[0];
-      queue.remove (0);
-
-      vertex_t& next = vertices_[next_id];
-      sorted_graph[new_id] = next;
-      id_map[next_id] = new_id--;
-
-      for (const auto& link : next.obj.all_links ()) {
-        removed_edges[link.objidx]++;
-        if (!(vertices_[link.objidx].incoming_edges () - removed_edges[link.objidx]))
-          queue.push (link.objidx);
-      }
-    }
-
-    check_success (!queue.in_error ());
-    check_success (!sorted_graph.in_error ());
-    if (!check_success (new_id == -1))
-      print_orphaned_nodes ();
-
-    remap_all_obj_indices (id_map, &sorted_graph);
-
-    hb_swap (vertices_, sorted_graph);
-    sorted_graph.fini_deep ();
-  }
-
-  /*
    * Generates a new topological sorting of graph ordered by the shortest
    * distance to each node.
    */
@@ -328,7 +275,7 @@ struct graph_t
     update_distances ();
 
     hb_priority_queue_t queue;
-    hb_vector_t<vertex_t> sorted_graph;
+    hb_vector_t<vertex_t> &sorted_graph = vertices_scratch_;
     if (unlikely (!check_success (sorted_graph.resize (vertices_.length)))) return;
     hb_vector_t<unsigned> id_map;
     if (unlikely (!check_success (id_map.resize (vertices_.length)))) return;
@@ -344,8 +291,9 @@ struct graph_t
     {
       unsigned next_id = queue.pop_minimum().second;
 
-      vertex_t& next = vertices_[next_id];
-      sorted_graph[new_id] = next;
+      hb_swap (sorted_graph[new_id], vertices_[next_id]);
+      const vertex_t& next = sorted_graph[new_id];
+
       id_map[next_id] = new_id--;
 
       for (const auto& link : next.obj.all_links ()) {
@@ -369,7 +317,6 @@ struct graph_t
     remap_all_obj_indices (id_map, &sorted_graph);
 
     hb_swap (vertices_, sorted_graph);
-    sorted_graph.fini_deep ();
   }
 
   /*
@@ -402,11 +349,15 @@ struct graph_t
     while (roots)
     {
       unsigned next = HB_SET_VALUE_INVALID;
+      if (unlikely (!check_success (!roots.in_error ()))) break;
       if (!roots.next (&next)) break;
 
       hb_set_t connected_roots;
       find_connected_nodes (next, roots, visited, connected_roots);
+      if (unlikely (!check_success (!connected_roots.in_error ()))) break;
+
       isolate_subgraph (connected_roots);
+      if (unlikely (!check_success (!connected_roots.in_error ()))) break;
 
       unsigned next_space = this->next_space ();
       num_roots_for_space_.push (0);
@@ -422,6 +373,8 @@ struct graph_t
       // TODO(grieger): special case for GSUB/GPOS use extension promotions to move 16 bit space
       //                into the 32 bit space as needed, instead of using isolation.
     }
+
+
 
     return true;
   }
@@ -575,12 +528,10 @@ struct graph_t
     // The last object is the root of the graph, so swap back the root to the end.
     // The root's obj idx does change, however since it's root nothing else refers to it.
     // all other obj idx's will be unaffected.
-    vertex_t root = vertices_[vertices_.length - 2];
-    vertices_[clone_idx] = *clone;
-    vertices_[vertices_.length - 1] = root;
+    hb_swap (vertices_[vertices_.length - 2], *clone);
 
     // Since the root moved, update the parents arrays of all children on the root.
-    for (const auto& l : root.obj.all_links ())
+    for (const auto& l : root ().obj.all_links ())
       vertices_[l.objidx].remap_parent (root_idx () - 1, root_idx ());
 
     return clone_idx;
@@ -865,7 +816,7 @@ struct graph_t
     // Redundant ones are filtered out later on by the visited set.
     // According to https://www3.cs.stonybrook.edu/~rezaul/papers/TR-07-54.pdf
     // for practical performance this is faster then using a more advanced queue
-    // (such as a fibonaacci queue) with a fast decrease priority.
+    // (such as a fibonacci queue) with a fast decrease priority.
     for (unsigned i = 0; i < vertices_.length; i++)
     {
       if (i == vertices_.length - 1)
@@ -1074,6 +1025,7 @@ struct graph_t
                              hb_set_t& visited,
                              hb_set_t& connected)
   {
+    if (unlikely (!check_success (!visited.in_error ()))) return;
     if (visited.has (start_idx)) return;
     visited.add (start_idx);
 
@@ -1096,6 +1048,7 @@ struct graph_t
  public:
   // TODO(garretrieger): make private, will need to move most of offset overflow code into graph.
   hb_vector_t<vertex_t> vertices_;
+  hb_vector_t<vertex_t> vertices_scratch_;
  private:
   bool parents_invalid;
   bool distance_invalid;
@@ -1104,8 +1057,9 @@ struct graph_t
   hb_vector_t<unsigned> num_roots_for_space_;
 };
 
-static bool _try_isolating_subgraphs (const hb_vector_t<graph_t::overflow_record_t>& overflows,
-                                      graph_t& sorted_graph)
+static inline
+bool _try_isolating_subgraphs (const hb_vector_t<graph_t::overflow_record_t>& overflows,
+                               graph_t& sorted_graph)
 {
   unsigned space = 0;
   hb_set_t roots_to_isolate;
@@ -1153,9 +1107,10 @@ static bool _try_isolating_subgraphs (const hb_vector_t<graph_t::overflow_record
   return true;
 }
 
-static bool _process_overflows (const hb_vector_t<graph_t::overflow_record_t>& overflows,
-                                hb_set_t& priority_bumped_parents,
-                                graph_t& sorted_graph)
+static inline
+bool _process_overflows (const hb_vector_t<graph_t::overflow_record_t>& overflows,
+                         hb_set_t& priority_bumped_parents,
+                         graph_t& sorted_graph)
 {
   bool resolution_attempted = false;
 
@@ -1213,14 +1168,14 @@ static bool _process_overflows (const hb_vector_t<graph_t::overflow_record_t>& o
  * For a detailed writeup describing how the algorithm operates see:
  * docs/repacker.md
  */
+template<typename T>
 inline hb_blob_t*
-hb_resolve_overflows (const hb_vector_t<hb_serialize_context_t::object_t *>& packed,
+hb_resolve_overflows (const T& packed,
                       hb_tag_t table_tag,
                       unsigned max_rounds = 20) {
   // Kahn sort is ~twice as fast as shortest distance sort and works for many fonts
   // so try it first to save time.
   graph_t sorted_graph (packed);
-  sorted_graph.sort_kahn ();
   if (!sorted_graph.will_overflow ())
   {
     return sorted_graph.serialize ();
